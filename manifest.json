@@ -1,0 +1,21 @@
+{
+  "id": "performance_monitor",
+  "name": "Performance Monitor",
+  "version": "1.4.0",
+  "entry": "main.lua",
+  "api": 2,
+  "profile": "content",
+  "game_version": ">=0.1.51 <2.0.0",
+  "category": "Tools",
+  "priority": 900,
+  "permissions": [
+    "engine_internals",
+    "filesystem"
+  ],
+  "affects_link": false,
+  "description": "Advanced FPS/per-mod fluidity profiler with automatic JSON/TXT diagnostic exports for Gen1Recomp.",
+  "authors": [
+    "FAFF0x",
+    "Ehren1337"
+  ]
+}
