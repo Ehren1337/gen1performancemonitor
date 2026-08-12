@@ -33,8 +33,12 @@ return function(mod)
   local frameSamples, frameSampleMax, frameSamplePos, frameSampleCount = {}, 300, 1, 0
   local logicSteps, logicPerSecond, logicWindowSteps = 0, 0, 0
   local f3WasDown, f4WasDown, f6WasDown, f7WasDown, f8WasDown, f9WasDown = false, false, false, false, false, false
+  local padChordWasDown = { up = false, down = false, left = false, right = false }
+  local padChordPending = {}
+  local controllerMode = false
   local colorTheme = 1
   local overlayFont
+  local controllerBindFont
   local COLOR_THEME_FILE = "performance_monitor_theme.txt"
   local UI_STATE_FILE = "performance_monitor_ui.txt"
   if love and love.filesystem and love.filesystem.read then
@@ -45,15 +49,18 @@ return function(mod)
   if love and love.filesystem and love.filesystem.read then
     local ok, saved = pcall(love.filesystem.read, UI_STATE_FILE)
     if ok and type(saved) == "string" then
-      local savedVisible, savedDetailed = saved:match("visible=(%d);detailed=(%d)")
+      local savedVisible, savedDetailed, savedController = saved:match(
+        "visible=(%d);detailed=(%d);controller=(%d)")
       if savedVisible then visible = savedVisible == "1" end
       if savedDetailed then detailed = savedDetailed == "1" end
+      if savedController then controllerMode = savedController == "1" end
     end
   end
   local function saveUiState()
     if love and love.filesystem and love.filesystem.write then
       pcall(love.filesystem.write, UI_STATE_FILE,
-        "visible=" .. (visible and "1" or "0") .. ";detailed=" .. (detailed and "1" or "0"))
+        "visible=" .. (visible and "1" or "0") .. ";detailed=" .. (detailed and "1" or "0")
+          .. ";controller=" .. (controllerMode and "1" or "0"))
     end
   end
 
@@ -633,6 +640,10 @@ return function(mod)
 
   local function record(owner, kind, slot, elapsed, draws, canvas, shaders)
     if not owner or owner == MOD_ID then return end
+    -- F3 hides the monitor completely.  Keep the hook wrappers installed so
+    -- the monitor can resume without a reload, but do not accumulate timing,
+    -- event, or draw statistics while the HUD is hidden.
+    if not visible then return end
     elapsed = clamp0(elapsed)
 
     local b = bucketFor(profiler.current, owner)
@@ -1352,28 +1363,95 @@ return function(mod)
     end
   end
 
+  local function controllerChordDown(button)
+    -- Use the engine's logical input state first. This covers Android and
+    -- raw/unrecognized controllers that do not expose SDL gamepad names.
+    local input = gameRef and gameRef.input
+    if input and input.isDown then
+      local down = input:isDown("select") and input:isDown(button)
+      if down then controllerMode = true end
+      return down
+    end
+    if not (love and love.joystick and love.joystick.getJoysticks) then return false end
+    local ok, joysticks = pcall(love.joystick.getJoysticks)
+    if not ok or type(joysticks) ~= "table" then return false end
+    if #joysticks > 0 then controllerMode = true end
+    for _, joystick in ipairs(joysticks) do
+      local okPad, isPad = false, false
+      if joystick and joystick.isGamepad then
+        okPad, isPad = pcall(function() return joystick:isGamepad() end)
+      end
+      if okPad and isPad and joystick.isGamepadDown then
+        local okHeld, held = pcall(function()
+          return joystick:isGamepadDown("back")
+            and joystick:isGamepadDown(button)
+        end)
+        if okHeld and held then return true end
+      end
+    end
+    return false
+  end
+
+  local function updateControllerHotkeys(t)
+    local chords = {
+      up = "hide", down = "compact", left = "colors_prev", right = "colors_next",
+    }
+    for button, action in pairs(chords) do
+      local queued = padChordPending[button]
+      local down = queued or controllerChordDown(button)
+      padChordPending[button] = nil
+      if queued then
+        controllerMode = true
+        saveUiState()
+      end
+      if down and not padChordWasDown[button] then
+        if action == "hide" then
+          visible = not visible
+          saveUiState()
+        elseif action == "compact" then
+          detailed = not detailed
+          saveUiState()
+        elseif action == "colors_prev" or action == "colors_next" then
+          colorTheme = action == "colors_next"
+            and (colorTheme % 5 + 1)
+            or ((colorTheme - 2) % 5 + 5) % 5 + 1
+          if love and love.filesystem and love.filesystem.write then
+            pcall(love.filesystem.write, COLOR_THEME_FILE, tostring(colorTheme))
+          end
+        end
+      end
+      padChordWasDown[button] = down
+    end
+  end
+
   local function updateHotkeys(t)
+    updateControllerHotkeys(t)
     if not (love and love.keyboard and love.keyboard.isDown) then return end
 
     local f3 = love.keyboard.isDown("f3")
+    local f4 = love.keyboard.isDown("f4")
+    local f6 = love.keyboard.isDown("f6")
+    local f7 = love.keyboard.isDown("f7")
+    local f8 = love.keyboard.isDown("f8")
+    local f9 = love.keyboard.isDown("f9")
+    if f3 or f4 or f6 or f7 or f8 or f9 then
+      controllerMode = false
+    end
     if f3 and not f3WasDown then
       visible = not visible
       saveUiState()
     end
     f3WasDown = f3
 
-    local f4 = love.keyboard.isDown("f4")
     if f4 and not f4WasDown then
       detailed = not detailed
       saveUiState()
     end
     f4WasDown = f4
 
-    local f6 = love.keyboard.isDown("f6")
     if f6 and not f6WasDown then resetProfiler(t) end
     f6WasDown = f6
 
-    local f7 = love.keyboard.isDown("f7")
     if f7 and not f7WasDown then
       colorTheme = colorTheme % 5 + 1
       if love and love.filesystem and love.filesystem.write then
@@ -1382,13 +1460,11 @@ return function(mod)
     end
     f7WasDown = f7
 
-    local f8 = love.keyboard.isDown("f8")
     if f8 and not f8WasDown then
       if diagnostic.active then stopDiagnostic(t) else startDiagnostic(t) end
     end
     f8WasDown = f8
 
-    local f9 = love.keyboard.isDown("f9")
     if f9 and not f9WasDown then
       if diagnostic.report then
         if not exportDiagnosticReport(diagnostic.report) then
@@ -1401,19 +1477,47 @@ return function(mod)
     f9WasDown = f9
   end
 
-  -- Fixed-step counter; it also lets us rescan late/hot-reloaded runtime
-  -- registrations even if the HUD is hidden.
+  -- Fixed-step counter used by the visible monitor and diagnostics.
   mod.hooks:wrap("input.step", function(nextFn, game, dt)
-    logicSteps = logicSteps + 1
-    logicWindowSteps = logicWindowSteps + 1
-    local t = now()
-    local elapsed = t - lastSecondTime
-    if elapsed >= 1.0 then
-      logicPerSecond = logicWindowSteps / elapsed
-      logicWindowSteps = 0
-      lastSecondTime = t
+    -- The directional chord is a monitor shortcut, not player movement.
+    -- Remove its queued edge before the engine promotes it; clearing state
+    -- only after nextFn was too late for repeated D-pad presses.
+    local input = game and game.input
+    if input and input.isDown and input.state then
+      if input:isDown("select") then
+        for _, direction in ipairs({ "up", "down", "left", "right" }) do
+          local queued = false
+          for _, btn in ipairs(input.pressQueue or {}) do
+            if btn == direction then queued = true break end
+          end
+          if input:isDown(direction) or queued then
+            padChordPending[direction] = true
+            input.state[direction] = false
+            if input.pressed then input.pressed[direction] = nil end
+            if input.pressQueue then
+              for i = #input.pressQueue, 1, -1 do
+                if input.pressQueue[i] == direction then
+                  table.remove(input.pressQueue, i)
+                end
+              end
+            end
+          end
+        end
+      end
     end
-    return nextFn(game, dt)
+    local result = nextFn(game, dt)
+    if visible then
+      logicSteps = logicSteps + 1
+      logicWindowSteps = logicWindowSteps + 1
+      local t = now()
+      local elapsed = t - lastSecondTime
+      if elapsed >= 1.0 then
+        logicPerSecond = logicWindowSteps / elapsed
+        logicWindowSteps = 0
+        lastSecondTime = t
+      end
+    end
+    return result
   end, 900)
 
   mod.events:on("game.ready", function(ev)
@@ -1453,7 +1557,14 @@ return function(mod)
     if not (love and love.graphics) then return end
     local t = now()
 
+    -- Hotkeys remain live while hidden; all actual monitoring work stops.
     updateHotkeys(t)
+    if not visible then
+      if diagnostic.active then stopDiagnostic(t) end
+      profiler.frameDirect = {}
+      profiler.frameDeep = {}
+      return
+    end
     if t - profiler.lastScan >= 0.50 then
       profiler.lastScan = t
       scanRuntime()
@@ -1550,6 +1661,9 @@ return function(mod)
     local pushed = love.graphics.push and pcall(love.graphics.push, "all")
     if love.graphics.newFont and not overlayFont then
       overlayFont = love.graphics.newFont(12)
+    end
+    if love.graphics.newFont and not controllerBindFont then
+      controllerBindFont = love.graphics.newFont(10)
     end
     if overlayFont and love.graphics.setFont then love.graphics.setFont(overlayFont) end
     local font = overlayFont or (love.graphics.getFont and love.graphics.getFont() or nil)
@@ -1650,11 +1764,20 @@ return function(mod)
           love.graphics.setColor(palette.card[1], palette.card[2], palette.card[3], palette.card[4])
           love.graphics.rectangle("fill", cardX, compactBindY, 103, 18, 3, 3)
           shadowText(key, cardX + 6, compactBindY + 3, palette.accent)
-          shadowText(label, cardX + 97 - textWidth(label), compactBindY + 3, {0.78, 0.82, 0.94, 1})
+          local labelRight = controllerMode and 100 or 97
+          shadowText(label, cardX + labelRight - textWidth(label), compactBindY + 3, {0.78, 0.82, 0.94, 1})
         end
-        compactBindCard("F3", "HIDE", x + 8)
-        compactBindCard("F4", "EXPAND", x + 119)
-        compactBindCard("F7", "COLORS", x + 230)
+        if controllerMode then
+          if controllerBindFont and love.graphics.setFont then love.graphics.setFont(controllerBindFont) end
+          compactBindCard("SEL+U", "HIDE", x + 8)
+          compactBindCard("SEL+D", "EXPAND", x + 119)
+          compactBindCard("SEL+L/R", "COLORS", x + 230)
+          if font and love.graphics.setFont then love.graphics.setFont(font) end
+        else
+          compactBindCard("F3", "HIDE", x + 8)
+          compactBindCard("F4", "EXPAND", x + 119)
+          compactBindCard("F7", "COLORS", x + 230)
+        end
         if pushed and love.graphics.pop then love.graphics.pop()
         else love.graphics.setColor(1, 1, 1, 1) end
         return
@@ -1710,16 +1833,25 @@ return function(mod)
         love.graphics.setColor(palette.card[1], palette.card[2], palette.card[3], palette.card[4])
         love.graphics.rectangle("fill", cardX, cardY, cardW, 18, 3, 3)
         shadowText(key, cardX + 6, cardY + 3, palette.accent)
-        shadowText(label, cardX + cardW - 6 - textWidth(label), cardY + 3, {0.78, 0.82, 0.94, 1})
+        local labelRight = controllerMode and cardW - 3 or cardW - 6
+        shadowText(label, cardX + labelRight - textWidth(label), cardY + 3, {0.78, 0.82, 0.94, 1})
       end
       local bindY = y + panelH - 70
-      bindCard("F3", "HIDE", x + 8, bindY, 103)
-      bindCard("F4", "COMPACT", x + 119, bindY, 103)
-      bindCard("F5", "RELOAD", x + 230, bindY, 103)
-      bindCard("F6", "RESET", x + 8, bindY + 20, 103)
-      bindCard("F7", "COLORS", x + 119, bindY + 20, 103)
-      bindCard("F8", "DIAG", x + 230, bindY + 20, 103)
-      bindCard("F9", "EXPORT", x + 8, bindY + 40, 103)
+      if controllerMode then
+        if controllerBindFont and love.graphics.setFont then love.graphics.setFont(controllerBindFont) end
+        bindCard("SEL+U", "HIDE", x + 8, bindY, 103)
+        bindCard("SEL+D", "COMPACT", x + 119, bindY, 103)
+        bindCard("SEL+L/R", "COLORS", x + 230, bindY, 103)
+        if font and love.graphics.setFont then love.graphics.setFont(font) end
+      else
+        bindCard("F3", "HIDE", x + 8, bindY, 103)
+        bindCard("F4", "COMPACT", x + 119, bindY, 103)
+        bindCard("F5", "RELOAD", x + 230, bindY, 103)
+        bindCard("F6", "RESET", x + 8, bindY + 20, 103)
+        bindCard("F7", "COLORS", x + 119, bindY + 20, 103)
+        bindCard("F8", "DIAG", x + 230, bindY + 20, 103)
+        bindCard("F9", "EXPORT", x + 8, bindY + 40, 103)
+      end
       if pushed and love.graphics.pop then love.graphics.pop()
       else love.graphics.setColor(1, 1, 1, 1) end
       return
@@ -1735,7 +1867,7 @@ return function(mod)
     local t = now()
     local frameMs = lastHudTime and ((t - lastHudTime) * 1000) or TARGET_MS
     lastHudTime = t
-    if frameMs > 0 and frameMs < 1000 then
+    if visible and frameMs > 0 and frameMs < 1000 then
       snapshot.frameMs = frameMs
       pushFrameSample(frameMs)
       finalizeFrame(frameMs)
