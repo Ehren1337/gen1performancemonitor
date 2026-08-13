@@ -1367,27 +1367,82 @@ return function(mod)
     -- Use the engine's logical input state first. This covers Android and
     -- raw/unrecognized controllers that do not expose SDL gamepad names.
     local input = gameRef and gameRef.input
+    local logicalSelect, logicalButton = false, false
     if input and input.isDown then
-      local down = input:isDown("select") and input:isDown(button)
-      if down then controllerMode = true end
-      return down
+      logicalSelect = input:isDown("select")
+      logicalButton = input:isDown(button)
+      if logicalSelect and logicalButton then
+        controllerMode = true
+        return true
+      end
     end
     if not (love and love.joystick and love.joystick.getJoysticks) then return false end
     local ok, joysticks = pcall(love.joystick.getJoysticks)
     if not ok or type(joysticks) ~= "table" then return false end
-    if #joysticks > 0 then controllerMode = true end
     for _, joystick in ipairs(joysticks) do
+      local physicalSelect = logicalSelect
       local okPad, isPad = false, false
       if joystick and joystick.isGamepad then
         okPad, isPad = pcall(function() return joystick:isGamepad() end)
       end
       if okPad and isPad and joystick.isGamepadDown then
         local okHeld, held = pcall(function()
+          local name = ({up = "dpup", down = "dpdown", left = "dpleft", right = "dpright"})[button]
           return joystick:isGamepadDown("back")
-            and joystick:isGamepadDown(button)
+            and name and joystick:isGamepadDown(name)
         end)
-        if okHeld and held then return true end
+        if okHeld and held then
+          controllerMode = true
+          return true
+        end
       end
+      if joystick and joystick.isDown and not physicalSelect then
+        for _, index in ipairs({ 7, 9 }) do
+          local okHeld, held = pcall(joystick.isDown, joystick, index)
+          if okHeld and held then physicalSelect = true break end
+        end
+      end
+      if physicalSelect and joystick then
+        local directionHeld = false
+        if joystick.getHatCount and joystick.getHat then
+          local okCount, count = pcall(joystick.getHatCount, joystick)
+          for hat = 1, (okCount and count or 0) do
+            local okHat, value = pcall(joystick.getHat, joystick, hat)
+            if okHat and type(value) == "string" and (
+              value == ({up = "u", down = "d", left = "l", right = "r"})[button]
+              or value == ({up = "lu", down = "ld", left = "l", right = "r"})[button]
+              or value == ({up = "ru", down = "rd", left = "l", right = "r"})[button]) then
+              directionHeld = true
+              break
+            end
+          end
+        end
+        if not directionHeld and joystick.getAxis then
+          local axis = (button == "left" or button == "right") and 1 or 2
+          local okAxis, value = pcall(joystick.getAxis, joystick, axis)
+          if okAxis and type(value) == "number" then
+            directionHeld = (button == "down" and value > 0.5)
+              or (button == "up" and value < -0.5)
+              or (button == "right" and value > 0.5)
+              or (button == "left" and value < -0.5)
+          end
+        end
+        if directionHeld then
+          controllerMode = true
+          return true
+        end
+      end
+    end
+    return false
+  end
+
+  local function inputHeldOrQueued(input, button)
+    if not input then return false end
+    if input.isDown and input:isDown(button) then return true end
+    local sources = input.sources and input.sources[button]
+    if sources and next(sources) ~= nil then return true end
+    for _, queued in ipairs(input.pressQueue or {}) do
+      if queued == button then return true end
     end
     return false
   end
@@ -1484,13 +1539,13 @@ return function(mod)
     -- only after nextFn was too late for repeated D-pad presses.
     local input = game and game.input
     if input and input.isDown and input.state then
-      if input:isDown("select") then
+      if inputHeldOrQueued(input, "select") then
         for _, direction in ipairs({ "up", "down", "left", "right" }) do
           local queued = false
           for _, btn in ipairs(input.pressQueue or {}) do
             if btn == direction then queued = true break end
           end
-          if input:isDown(direction) or queued then
+          if inputHeldOrQueued(input, direction) or queued then
             padChordPending[direction] = true
             input.state[direction] = false
             if input.pressed then input.pressed[direction] = nil end
@@ -1506,6 +1561,19 @@ return function(mod)
       end
     end
     local result = nextFn(game, dt)
+    -- The engine promotes queued controller input inside nextFn.  Some
+    -- handhelds, including the R36H, expose Down only at that point, so
+    -- mirror the same pressed/held state the player movement code reads.
+    if input and input.isDown and inputHeldOrQueued(input, "select") then
+      for _, direction in ipairs({ "up", "down", "left", "right" }) do
+        local pressed = input.pressed and input.pressed[direction]
+        if pressed or input:isDown(direction) then
+          padChordPending[direction] = true
+          if input.state then input.state[direction] = false end
+          if input.pressed then input.pressed[direction] = nil end
+        end
+      end
+    end
     if visible then
       logicSteps = logicSteps + 1
       logicWindowSteps = logicWindowSteps + 1
@@ -1659,11 +1727,17 @@ return function(mod)
     end
 
     local pushed = love.graphics.push and pcall(love.graphics.push, "all")
+    local screenW, screenH = love.graphics.getDimensions()
+    local smallScreen = screenW <= 640 or screenH <= 480
     if love.graphics.newFont and not overlayFont then
       overlayFont = love.graphics.newFont(12)
+      if overlayFont.setFilter then pcall(overlayFont.setFilter, overlayFont, "linear", "linear") end
     end
     if love.graphics.newFont and not controllerBindFont then
-      controllerBindFont = love.graphics.newFont(10)
+      controllerBindFont = love.graphics.newFont(smallScreen and 11 or 11)
+      if controllerBindFont.setFilter then
+        pcall(controllerBindFont.setFilter, controllerBindFont, "linear", "linear")
+      end
     end
     if overlayFont and love.graphics.setFont then love.graphics.setFont(overlayFont) end
     local font = overlayFont or (love.graphics.getFont and love.graphics.getFont() or nil)
@@ -1671,10 +1745,12 @@ return function(mod)
 
     do
       local panelW = 350
-      local screenW, screenH = love.graphics.getDimensions()
       local widthFit = (screenW - 24) / panelW
-      local uiScale = math.max(0.72, math.min(1.0, widthFit,
-        screenW / 1024, screenH / 768))
+      -- Keep the pixel font crisp on handhelds.  A 640x480 display can fit
+      -- the compact dashboard at native scale; fractional scaling makes the
+      -- font look blurred on the R36H panel.
+      local uiScale = math.max(0.82, math.min(1.0, widthFit,
+        screenW / 640, screenH / 480))
       love.graphics.scale(uiScale, uiScale)
       local palettes = {
         {panel = {0.025, 0.035, 0.075, 0.98}, header = {0.18, 0.75, 0.98, 1}, accent = {0.55, 0.88, 1.00, 1}, section = {0.12, 0.16, 0.28, 1}, card = {0.06, 0.08, 0.16, 1}},
@@ -1688,20 +1764,28 @@ return function(mod)
       local rowCount = math.min(5, #tableRows)
       local headerH, statsH, chartH, engineH, statusH = 30, 38, 78, 127, 0
       local tableH, footerH = 22 + math.max(1, rowCount) * 19, 72
-      local compact = not detailed or screenW < 900 or screenH < 650
+      -- `detailed` is the user's explicit compact/expand choice.  Do not
+      -- override it on handhelds: that made Select+Down appear broken by
+      -- forcing the R36H back into compact mode immediately.
+      local compact = not detailed
       local panelH = compact and (headerH + statsH + chartH + 39)
         or (headerH + statsH + chartH + engineH + statusH + tableH + footerH + 18)
       local x, y = 12 / uiScale, 12 / uiScale
 
       local function textWidth(s)
-        return (font and font.getWidth) and font:getWidth(s) or (#s * 7)
+        local activeFont = love.graphics.getFont and love.graphics.getFont() or font
+        return (activeFont and activeFont.getWidth) and activeFont:getWidth(s) or (#s * 7)
       end
       local function shadowText(s, tx, ty, color)
-        love.graphics.setColor(0, 0, 0, 0.95)
-        love.graphics.print(s, tx + 1, ty + 1)
+        if not smallScreen then
+          love.graphics.setColor(0, 0, 0, 0.95)
+          love.graphics.print(s, tx + 1, ty + 1)
+        end
         love.graphics.setColor(color[1], color[2], color[3], color[4] or 1)
         love.graphics.print(s, tx, ty)
       end
+      local bindKeyColor = palette.accent
+      local bindLabelColor = {0.78, 0.82, 0.94, 1}
       local function gauge(label, value, maximum, suffix, gy, color)
         local barX, barW = x + 88, panelW - 105
         local amount = math.max(0, math.min(1, (tonumber(value) or 0) / maximum))
@@ -1763,9 +1847,9 @@ return function(mod)
         local function compactBindCard(key, label, cardX)
           love.graphics.setColor(palette.card[1], palette.card[2], palette.card[3], palette.card[4])
           love.graphics.rectangle("fill", cardX, compactBindY, 103, 18, 3, 3)
-          shadowText(key, cardX + 6, compactBindY + 3, palette.accent)
+          shadowText(key, cardX + 6, compactBindY + 3, bindKeyColor)
           local labelRight = controllerMode and 100 or 97
-          shadowText(label, cardX + labelRight - textWidth(label), compactBindY + 3, {0.78, 0.82, 0.94, 1})
+          shadowText(label, cardX + labelRight - textWidth(label), compactBindY + 3, bindLabelColor)
         end
         if controllerMode then
           if controllerBindFont and love.graphics.setFont then love.graphics.setFont(controllerBindFont) end
@@ -1832,9 +1916,9 @@ return function(mod)
       local function bindCard(key, label, cardX, cardY, cardW)
         love.graphics.setColor(palette.card[1], palette.card[2], palette.card[3], palette.card[4])
         love.graphics.rectangle("fill", cardX, cardY, cardW, 18, 3, 3)
-        shadowText(key, cardX + 6, cardY + 3, palette.accent)
+        shadowText(key, cardX + 6, cardY + 3, bindKeyColor)
         local labelRight = controllerMode and cardW - 3 or cardW - 6
-        shadowText(label, cardX + labelRight - textWidth(label), cardY + 3, {0.78, 0.82, 0.94, 1})
+        shadowText(label, cardX + labelRight - textWidth(label), cardY + 3, bindLabelColor)
       end
       local bindY = y + panelH - 70
       if controllerMode then
