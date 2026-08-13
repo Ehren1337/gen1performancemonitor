@@ -16,6 +16,7 @@ return function(mod)
   local gameRef
   local visible = true
   local detailed = false
+  local extremeCompact = false
   local now = (love and love.timer and love.timer.getTime) or os.clock
 
   local TARGET_MS = 1000 / 60
@@ -49,19 +50,39 @@ return function(mod)
   if love and love.filesystem and love.filesystem.read then
     local ok, saved = pcall(love.filesystem.read, UI_STATE_FILE)
     if ok and type(saved) == "string" then
-      local savedVisible, savedDetailed, savedController = saved:match(
-        "visible=(%d);detailed=(%d);controller=(%d)")
+      local savedVisible, savedDetailed, savedController, savedExtreme = saved:match(
+        "visible=(%d);detailed=(%d);controller=(%d);extreme=(%d)")
+      if not savedVisible then
+        savedVisible, savedDetailed, savedController = saved:match(
+          "visible=(%d);detailed=(%d);controller=(%d)")
+      end
+      if not savedVisible then
+        savedVisible, savedDetailed = saved:match("visible=(%d);detailed=(%d)")
+      end
       if savedVisible then visible = savedVisible == "1" end
       if savedDetailed then detailed = savedDetailed == "1" end
       if savedController then controllerMode = savedController == "1" end
+      if savedExtreme then extremeCompact = savedExtreme == "1" end
     end
   end
   local function saveUiState()
     if love and love.filesystem and love.filesystem.write then
       pcall(love.filesystem.write, UI_STATE_FILE,
         "visible=" .. (visible and "1" or "0") .. ";detailed=" .. (detailed and "1" or "0")
-          .. ";controller=" .. (controllerMode and "1" or "0"))
+          .. ";controller=" .. (controllerMode and "1" or "0")
+          .. ";extreme=" .. (extremeCompact and "1" or "0"))
     end
+  end
+  local function cycleDisplayMode()
+    if detailed then
+      detailed = false
+      extremeCompact = true
+    elseif extremeCompact then
+      extremeCompact = false
+    else
+      detailed = true
+    end
+    saveUiState()
   end
 
   local snapshot = {
@@ -1464,8 +1485,7 @@ return function(mod)
           visible = not visible
           saveUiState()
         elseif action == "compact" then
-          detailed = not detailed
-          saveUiState()
+          cycleDisplayMode()
         elseif action == "colors_prev" or action == "colors_next" then
           colorTheme = action == "colors_next"
             and (colorTheme % 5 + 1)
@@ -1499,8 +1519,7 @@ return function(mod)
     f3WasDown = f3
 
     if f4 and not f4WasDown then
-      detailed = not detailed
-      saveUiState()
+      cycleDisplayMode()
     end
     f4WasDown = f4
 
@@ -1744,7 +1763,7 @@ return function(mod)
     local lineH = font and font.getHeight and font:getHeight() or 12
 
     do
-      local panelW = 350
+      local panelW = extremeCompact and 230 or 350
       local widthFit = (screenW - 24) / panelW
       -- Keep the pixel font crisp on handhelds.  A 640x480 display can fit
       -- the compact dashboard at native scale; fractional scaling makes the
@@ -1768,8 +1787,10 @@ return function(mod)
       -- override it on handhelds: that made Select+Down appear broken by
       -- forcing the R36H back into compact mode immediately.
       local compact = not detailed
-      local panelH = compact and (headerH + statsH + chartH + 39)
+      local panelH = extremeCompact and (headerH + statsH + 8)
+        or (compact and (headerH + statsH + chartH + 39)
         or (headerH + statsH + chartH + engineH + statusH + tableH + footerH + 18)
+        )
       local x, y = 12 / uiScale, 12 / uiScale
 
       local function textWidth(s)
@@ -1813,8 +1834,17 @@ return function(mod)
         shadowText(valueText, cardX + 103 - 7 - textWidth(valueText), statsY + 2, color)
       end
       numberCard("FPS", fmtInt(snapshot.fps), "", x + 8, {0.35, 1.00, 0.62, 1})
-      numberCard("LOW", fmtInt(snapshot.low1), "", x + 119, {0.38, 0.84, 1.00, 1})
-      numberCard("LUA", string.format("%.1f", snapshot.luaMB), " MB", x + 230, {0.72, 0.56, 1.00, 1})
+      if not extremeCompact then
+        numberCard("LOW", fmtInt(snapshot.low1), "", x + 119, {0.38, 0.84, 1.00, 1})
+      end
+      numberCard("LUA", string.format("%.1f", snapshot.luaMB), " MB",
+        x + (extremeCompact and 119 or 230), {0.72, 0.56, 1.00, 1})
+
+      if extremeCompact then
+        if pushed and love.graphics.pop then love.graphics.pop()
+        else love.graphics.setColor(1, 1, 1, 1) end
+        return
+      end
 
       local chartY = statsY + statsH
       local chartX, chartW, chartBoxH = x + 8, panelW - 16, 51
@@ -1972,6 +2002,7 @@ return function(mod)
     copy.logicSteps = logicSteps
     copy.visible = visible
     copy.detailed = detailed
+    copy.extremeCompact = extremeCompact
     copy.slowThresholdMs = SLOW_MS
     copy.mods = {}
     for i, r in ipairs(profiler.ranked) do
